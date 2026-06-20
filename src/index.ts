@@ -43,7 +43,7 @@ async function main() {
   const port = portIndex !== -1 ? parseInt(args[portIndex + 1], 10) : 8000
 
   if (mode === "http" || mode === "sse") {
-    await startHTTPServer(createServer, port)
+    await startHTTPServer(createServer, port, apiClient)
   } else {
     // STDIO 모드
     // stdout 오염 방지: MCP JSON-RPC 프로토콜 보호
