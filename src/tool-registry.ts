@@ -788,6 +788,36 @@ const exposedTools = allTools.filter(t => V3_EXPOSED.has(t.name))
 /** 노출/전체 도구 수 — 헬스체크 등 표기용 파생값 (하드코딩 금지) */
 export const TOOL_COUNTS = { exposed: exposedTools.length, total: allTools.length }
 
+/**
+ * 이름으로 도구 실행 — MCP CallTool 핸들러와 REST 엔드포인트(/meta-lawyer)가
+ * 공유하는 단일 실행 경로. 스키마 검증 + 핸들러 호출 + 에러 표준화를 한곳에서 처리한다.
+ * 전체 도구(allTools) 실행 가능 — execute_tool 프록시와 동일 범위.
+ */
+export async function runToolByName(
+  apiClient: LawApiClient,
+  name: string,
+  args: unknown
+): Promise<{ content: { type: "text"; text: string }[]; isError: boolean }> {
+  const tool = toolMap.get(name)
+  if (!tool) {
+    return { content: [{ type: "text", text: `Unknown tool: ${name}` }], isError: true }
+  }
+  try {
+    const input = tool.schema.parse(args)
+    const result = await tool.handler(apiClient, input)
+    return {
+      content: result.content.map(c => ({ type: "text" as const, text: c.text })),
+      isError: !!result.isError,
+    }
+  } catch (error) {
+    const errResult = formatToolError(error, name)
+    return {
+      content: errResult.content.map(c => ({ type: "text" as const, text: c.text })),
+      isError: true,
+    }
+  }
+}
+
 export function registerTools(server: Server, apiClient: LawApiClient) {
   // ListTools 핸들러
   server.setRequestHandler(ListToolsRequestSchema, async () => ({
@@ -798,31 +828,10 @@ export function registerTools(server: Server, apiClient: LawApiClient) {
     }))
   }))
 
-  // CallTool 핸들러 — 전체 도구 실행 가능 (execute_tool 프록시 지원)
+  // CallTool 핸들러 — 전체 도구 실행 가능 (execute_tool 프록시 지원).
+  // 실행 로직은 runToolByName으로 일원화 (REST /meta-lawyer와 공유).
   server.setRequestHandler(CallToolRequestSchema, async (request) => {
     const { name, arguments: args } = request.params
-
-    const tool = toolMap.get(name)
-    if (!tool) {
-      return {
-        content: [{ type: "text" as const, text: `Unknown tool: ${name}` }],
-        isError: true
-      }
-    }
-
-    try {
-      const input = tool.schema.parse(args)
-      const result = await tool.handler(apiClient, input)
-      return {
-        content: result.content.map(c => ({ type: "text" as const, text: c.text })),
-        isError: result.isError
-      }
-    } catch (error) {
-      const errResult = formatToolError(error, name)
-      return {
-        content: errResult.content.map(c => ({ type: "text" as const, text: c.text })),
-        isError: true
-      }
-    }
+    return runToolByName(apiClient, name, args)
   })
 }

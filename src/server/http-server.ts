@@ -7,11 +7,13 @@
  */
 
 import express from "express"
+import type { Request } from "express"
 import type { Server } from "@modelcontextprotocol/sdk/server/index.js"
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js"
+import type { LawApiClient } from "../lib/api-client.js"
 import { requestContext } from "../lib/session-state.js"
 import { maskSensitiveUrl } from "../lib/fetch-with-retry.js"
-import { TOOL_COUNTS } from "../tool-registry.js"
+import { TOOL_COUNTS, runToolByName } from "../tool-registry.js"
 import { VERSION } from "../version.js"
 
 /**
@@ -28,7 +30,7 @@ function scrubError(error: unknown): { message: string; stack?: string } {
   return { message: maskSensitiveUrl(String(error)) }
 }
 
-export async function startHTTPServer(createServer: () => Server, port: number) {
+export async function startHTTPServer(createServer: () => Server, port: number, apiClient: LawApiClient) {
   const app = express()
   // trust proxy: TRUST_PROXY 환경변수로 조정 (기본 '1' = 첫 프록시만 신뢰).
   // 'true' 또는 'all'은 X-Forwarded-For 스푸핑으로 rate limit 우회 위험.
@@ -107,6 +109,7 @@ export async function startHTTPServer(createServer: () => Server, port: number) 
       transport: "streamable-http (stateless)",
       endpoints: {
         mcp: "/mcp",
+        metaLawyer: "/meta-lawyer",
         health: "/health",
       },
       tools: {
@@ -135,11 +138,10 @@ export async function startHTTPServer(createServer: () => Server, port: number) 
     return ++fallbackBucket.count <= fallbackRpm
   }
 
-  // POST /mcp - stateless 요청 처리
-  app.post("/mcp", async (req, res) => {
-    // Extract API key: header > URL query
-    // 쿼리스트링 키는 프록시/엣지 액세스 로그에 평문으로 남으므로 헤더 사용 권장 (하위호환용 유지)
-    const apiKey =
+  // API 키 추출: 헤더 우선 > URL 쿼리 (MCP·REST 공통).
+  // 쿼리스트링 키는 프록시/엣지 액세스 로그에 평문으로 남으므로 헤더 사용 권장 (하위호환용 유지).
+  function extractApiKey(req: Request): string | undefined {
+    return (
       (req.headers["apikey"] as string | undefined) ||
       (req.headers["law_oc"] as string | undefined) ||
       (req.headers["law-oc"] as string | undefined) ||
@@ -147,6 +149,12 @@ export async function startHTTPServer(createServer: () => Server, port: number) 
       (req.headers["authorization"] as string | undefined)?.replace(/^Bearer\s+/i, "") ||
       (req.headers["x-law-oc"] as string | undefined) ||
       (req.query.oc as string | undefined)
+    )
+  }
+
+  // POST /mcp - stateless 요청 처리
+  app.post("/mcp", async (req, res) => {
+    const apiKey = extractApiKey(req)
 
     // 자체 키 없는 요청은 서버 LAW_OC로 폴백 — 전역 상한 적용
     if (!apiKey && !fallbackAllowed()) {
@@ -213,6 +221,76 @@ export async function startHTTPServer(createServer: () => Server, port: number) 
       error: { code: -32000, message: "Method not allowed. Server runs in stateless mode." },
       id: null
     })
+  })
+
+  // POST /meta-lawyer — 메타 변호사(에이전트)용 법률검토 단순 창구 (REST).
+  // 전산 백엔드(자바)가 MCP 프로토콜 핸드셰이크 없이 한 번의 POST로 법령 검토 결과를 받는다.
+  // mode 미지정 → legal_research(task 리서치). mode 지정 → legal_analysis(정밀 검증·분석).
+  // body: { query?, task?(기본 dispute_prep), text?, domain?, maxClauses?,   ← legal_research
+  //         mode?, caseNumber?, lawName?, jo?, date?, maxCitations? }          ← legal_analysis
+  //   - task=dispute_prep    : 불복·분쟁 준비 (환불·분쟁 법적 대응)
+  //   - task=document_review : 계약서/약관 조항 리스크 (text 필수)
+  //   - task=amendment_track : 법령 개정 추적 (법령 변경 모니터링)
+  //   - mode=verify_citations: 텍스트 속 조문 인용 실존 교차검증 (text 필수, 환각 방지)
+  app.post("/meta-lawyer", async (req, res) => {
+    const apiKey = extractApiKey(req)
+    if (!apiKey && !fallbackAllowed()) {
+      res.status(429).json({
+        ok: false,
+        error: "Shared API quota exceeded. Provide your own key via 'apiKey' header (free: https://open.law.go.kr).",
+      })
+      return
+    }
+
+    const body = (req.body ?? {}) as Record<string, unknown>
+    const str = (v: unknown): string | undefined => (typeof v === "string" ? v : undefined)
+    const num = (v: unknown): number | undefined => (typeof v === "number" ? v : undefined)
+    const mode = str(body.mode)
+
+    // mode 지정 시 legal_analysis(검증·분석), 아니면 legal_research(task 리서치).
+    const toolName = mode ? "legal_analysis" : "legal_research"
+    const task = mode ? undefined : (str(body.task) ?? "dispute_prep")
+    const args = mode
+      ? {
+          mode,
+          text: str(body.text),
+          caseNumber: str(body.caseNumber),
+          lawName: str(body.lawName),
+          jo: str(body.jo),
+          date: str(body.date),
+          maxCitations: num(body.maxCitations),
+        }
+      : {
+          query: str(body.query),
+          task,
+          text: str(body.text),
+          domain: str(body.domain),
+          maxClauses: num(body.maxClauses),
+        }
+
+    try {
+      const result = await requestContext.run({ apiKey }, () =>
+        runToolByName(apiClient, toolName, args)
+      )
+      const text = result.content.map(c => c.text).join("\n")
+      res.json({
+        ok: !result.isError,
+        tool: toolName,
+        mode: mode ?? null,
+        task: task ?? null,
+        query: str(body.query) ?? null,
+        result: text,
+      })
+    } catch (error) {
+      const scrubbed = scrubError(error)
+      console.error("[POST /meta-lawyer] Error:", scrubbed.message)
+      if (scrubbed.stack && process.env.NODE_ENV !== "production") {
+        console.error(scrubbed.stack)
+      }
+      if (!res.headersSent) {
+        res.status(500).json({ ok: false, error: "Internal server error" })
+      }
+    }
   })
 
   // 서버 시작 (0.0.0.0으로 바인딩하여 외부 접속 허용)
