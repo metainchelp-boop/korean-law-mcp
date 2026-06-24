@@ -1,0 +1,22 @@
+name: PR Build Check (MCP)
+
+# PR에서만 실행. main 머지는 배포가 아니므로(Fly.io 별도) 안전.
+on:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+      - name: 의존성 설치
+        run: npm ci || npm install
+      - name: TypeScript 빌드
+        run: npm run build
